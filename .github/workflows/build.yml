@@ -1,0 +1,107 @@
+name: Build La Isla de los Dragoncitos
+
+# Sube el .zip del mod tal cual a la raiz del repositorio (sin descomprimir).
+# El workflow elige solo el zip que contiene el mod (aunque haya otros zips en el repo),
+# lo abre, compila y deja el .jar en Actions -> (ejecucion) -> Artifacts.
+# Tambien funciona si subes el proyecto ya descomprimido.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Descomprimir el zip del mod
+        run: |
+          python3 - <<'PY'
+          import glob, os, shutil, subprocess, zipfile
+
+          def commit_time(path):
+              try:
+                  out = subprocess.run(['git', 'log', '-1', '--format=%ct', '--', path],
+                                       capture_output=True, text=True).stdout.strip()
+                  return int(out) if out else 0
+              except Exception:
+                  return 0
+
+          def has_gradle(path):
+              try:
+                  with zipfile.ZipFile(path) as z:
+                      names = [n.replace('\\', '/') for n in z.namelist()]
+                  return any(n.endswith('build.gradle') or n.endswith('build.gradle.kts') for n in names)
+              except Exception:
+                  return False
+
+          zips = glob.glob('*.zip')
+          print('Zips en el repositorio:', zips)
+          good = [z for z in zips if has_gradle(z)]
+          print('Zips con un proyecto Gradle:', good)
+          good.sort(key=lambda z: ('dragoncitos' in z.lower(), commit_time(z), os.path.getmtime(z), z), reverse=True)
+
+          shutil.rmtree('mod_build', ignore_errors=True)
+          os.makedirs('mod_build', exist_ok=True)
+          if good:
+              print('Usando', good[0])
+              with zipfile.ZipFile(good[0]) as z:
+                  for info in z.infolist():
+                      name = info.filename.replace('\\', '/')
+                      if name.endswith('/'):
+                          continue
+                      target = os.path.join('mod_build', name)
+                      os.makedirs(os.path.dirname(target), exist_ok=True)
+                      with open(target, 'wb') as out:
+                          out.write(z.read(info))
+          else:
+              print('No hay zip con proyecto: se compila el repositorio tal cual')
+              for item in os.listdir('.'):
+                  if item not in ('mod_build', '.git', '.github'):
+                      dest = os.path.join('mod_build', item)
+                      (shutil.copytree if os.path.isdir(item) else shutil.copy2)(item, dest)
+
+          roots = [os.path.dirname(p) for p in glob.glob('mod_build/**/build.gradle', recursive=True)]
+          if not roots:
+              raise SystemExit('ERROR: no se encontro ningun build.gradle ni en los zips ni en el repositorio')
+          root = sorted(roots, key=len)[0]
+          print('Raiz del proyecto:', root)
+          with open(os.environ['GITHUB_ENV'], 'a') as env:
+              env.write('MOD_ROOT=' + root + '\n')
+          PY
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Set up Gradle 8.1.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.1.1'
+
+      - name: Build with Gradle
+        working-directory: ${{ env.MOD_ROOT }}
+        run: gradle build --no-daemon --stacktrace
+
+      - name: Comprobar que el jar tiene clases
+        run: |
+          set -e
+          ls "$MOD_ROOT"/build/libs/*.jar
+          for jar in "$MOD_ROOT"/build/libs/*.jar; do
+            n=$(unzip -l "$jar" | grep -c '\.class' || true)
+            echo "$jar -> $n clases"
+            [ "$n" -gt 0 ]
+          done
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Mod-JAR
+          path: ${{ env.MOD_ROOT }}/build/libs/*.jar
+          if-no-files-found: error
